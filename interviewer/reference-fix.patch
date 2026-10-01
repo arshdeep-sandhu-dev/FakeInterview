@@ -1,0 +1,276 @@
+diff -ruN a/shipfast/src/main/java/com/shipfast/audit/OrderAuditListener.java b/shipfast/src/main/java/com/shipfast/audit/OrderAuditListener.java
+--- a/shipfast/src/main/java/com/shipfast/audit/OrderAuditListener.java
++++ b/shipfast/src/main/java/com/shipfast/audit/OrderAuditListener.java
+@@ -21,7 +21,7 @@
+                 .append(" total=").append(event.total());
+         if (event.discount().isPositive()) {
+             detail.append(" discount=").append(event.discount())
+-                    .append(" promo=").append(event.couponCode().toUpperCase(Locale.ROOT));
++                    .append(" promo=").append(String.join(",", event.promotions()).toUpperCase(Locale.ROOT));
+         }
+         audit.record("ORDER_PLACED", event.orderId(), detail.toString());
+     }
+diff -ruN a/shipfast/src/main/java/com/shipfast/common/Money.java b/shipfast/src/main/java/com/shipfast/common/Money.java
+--- a/shipfast/src/main/java/com/shipfast/common/Money.java
++++ b/shipfast/src/main/java/com/shipfast/common/Money.java
+@@ -114,12 +114,12 @@
+         if (!(o instanceof Money)) {
+             return false;
+         }
+-        return amount.equals(((Money) o).amount);
++        return amount.compareTo(((Money) o).amount) == 0;
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return amount.hashCode();
++        return amount.stripTrailingZeros().hashCode();
+     }
+ 
+     @Override
+diff -ruN a/shipfast/src/main/java/com/shipfast/events/EventBus.java b/shipfast/src/main/java/com/shipfast/events/EventBus.java
+--- a/shipfast/src/main/java/com/shipfast/events/EventBus.java
++++ b/shipfast/src/main/java/com/shipfast/events/EventBus.java
+@@ -29,11 +29,21 @@
+     public void publish(DomainEvent event) {
+         for (Subscription<?> subscription : subscriptions) {
+             if (subscription.accepts(event)) {
+-                subscription.deliver(event);
++                try {
++                    subscription.deliver(event);
++                } catch (RuntimeException e) {
++                    failures.add(e);
++                }
+             }
+         }
+     }
+ 
++    private final List<RuntimeException> failures = new CopyOnWriteArrayList<>();
++
++    public List<RuntimeException> failures() {
++        return List.copyOf(failures);
++    }
++
+     public int subscriberCount() {
+         return subscriptions.size();
+     }
+diff -ruN a/shipfast/src/main/java/com/shipfast/inventory/InventoryService.java b/shipfast/src/main/java/com/shipfast/inventory/InventoryService.java
+--- a/shipfast/src/main/java/com/shipfast/inventory/InventoryService.java
++++ b/shipfast/src/main/java/com/shipfast/inventory/InventoryService.java
+@@ -37,7 +37,7 @@
+     }
+ 
+     /** Records a delivery from a supplier. */
+-    public void receive(String sku, int quantity) {
++    public synchronized void receive(String sku, int quantity) {
+         requirePositive(quantity);
+         received.merge(sku, quantity, Integer::sum);
+         available.merge(sku, quantity, Integer::sum);
+@@ -48,7 +48,7 @@
+      *
+      * @return false if there is not enough available stock; nothing is reserved in that case
+      */
+-    public boolean reserve(String sku, int quantity) {
++    public synchronized boolean reserve(String sku, int quantity) {
+         requirePositive(quantity);
+         Integer onShelf = available.get(sku);
+         if (onShelf == null || onShelf < quantity) {
+@@ -64,7 +64,7 @@
+     }
+ 
+     /** Returns reserved units to the shelf, e.g. when payment is declined. */
+-    public void release(String sku, int quantity) {
++    public synchronized void release(String sku, int quantity) {
+         requirePositive(quantity);
+         int held = reserved.getOrDefault(sku, 0);
+         if (quantity > held) {
+@@ -76,7 +76,7 @@
+     }
+ 
+     /** Marks reserved units as sold once payment has been captured. */
+-    public void commit(String sku, int quantity) {
++    public synchronized void commit(String sku, int quantity) {
+         requirePositive(quantity);
+         int held = reserved.getOrDefault(sku, 0);
+         if (quantity > held) {
+@@ -99,7 +99,7 @@
+         return sold.getOrDefault(sku, 0);
+     }
+ 
+-    public StockSnapshot snapshot(String sku) {
++    public synchronized StockSnapshot snapshot(String sku) {
+         return new StockSnapshot(
+                 sku,
+                 received.getOrDefault(sku, 0),
+diff -ruN a/shipfast/src/main/java/com/shipfast/order/OrderLine.java b/shipfast/src/main/java/com/shipfast/order/OrderLine.java
+--- a/shipfast/src/main/java/com/shipfast/order/OrderLine.java
++++ b/shipfast/src/main/java/com/shipfast/order/OrderLine.java
+@@ -8,6 +8,7 @@
+ 
+     private final Product product;
+     private final int quantity;
++    private final Money unitPrice;
+ 
+     public OrderLine(Product product, int quantity) {
+         if (quantity <= 0) {
+@@ -15,6 +16,7 @@
+         }
+         this.product = Objects.requireNonNull(product, "product");
+         this.quantity = quantity;
++        this.unitPrice = product.getPrice();
+     }
+ 
+     public Product product() {
+@@ -30,7 +32,7 @@
+     }
+ 
+     public Money unitPrice() {
+-        return product.getPrice();
++        return unitPrice;
+     }
+ 
+     public Money lineTotal() {
+diff -ruN a/shipfast/src/main/java/com/shipfast/order/OrderService.java b/shipfast/src/main/java/com/shipfast/order/OrderService.java
+--- a/shipfast/src/main/java/com/shipfast/order/OrderService.java
++++ b/shipfast/src/main/java/com/shipfast/order/OrderService.java
+@@ -79,22 +79,40 @@
+         }
+         PriceBreakdown price = pricing.quote(lines, customer.shippingAddress(), coupon);
+ 
+-        reserveStock(lines);
+-
+-        Order order = new Order(ids.next("ord"), customer.id(), lines, price, clock.instant());
+-        PaymentOutcome payment = payments.charge(order.getId(), customer.paymentToken(), price.total());
++        if (coupon != null) {
++            coupons.claim(coupon);
++        }
++        List<OrderLine> reserved = new ArrayList<>();
++        PaymentOutcome payment;
++        Order order;
++        try {
++            for (OrderLine line : lines) {
++                if (!inventory.reserve(line.sku(), line.quantity())) {
++                    throw new OutOfStockException(line.sku(), line.quantity());
++                }
++                reserved.add(line);
++            }
++            order = new Order(ids.next("ord"), customer.id(), lines, price, clock.instant());
++            payment = payments.charge(order.getId(), customer.paymentToken(), price.total());
++        } catch (RuntimeException e) {
++            releaseStock(reserved);
++            if (coupon != null) {
++                coupons.unclaim(coupon);
++            }
++            throw e;
++        }
+ 
+         if (!payment.approved()) {
+             releaseStock(lines);
++            if (coupon != null) {
++                coupons.unclaim(coupon);
++            }
+             order.markDeclined(payment.declineCode());
+             orders.save(order);
+             return order;
+         }
+ 
+         commitStock(lines);
+-        if (coupon != null) {
+-            coupons.redeem(coupon);
+-        }
+         order.markPaid(payment.transactionId());
+         orders.save(order);
+         events.publish(placedEvent(order, customer, price));
+diff -ruN a/shipfast/src/main/java/com/shipfast/payment/PaymentService.java b/shipfast/src/main/java/com/shipfast/payment/PaymentService.java
+--- a/shipfast/src/main/java/com/shipfast/payment/PaymentService.java
++++ b/shipfast/src/main/java/com/shipfast/payment/PaymentService.java
+@@ -32,8 +32,8 @@
+             throw new IllegalArgumentException("Charge amount must be positive, was " + amount);
+         }
+         int attempt = 1;
++        ChargeRequest request = new ChargeRequest("charge-" + orderId, paymentToken, amount, orderId);
+         while (true) {
+-            ChargeRequest request = new ChargeRequest(ids.next("chg"), paymentToken, amount, orderId);
+             try {
+                 ChargeResponse response = gateway.charge(request);
+                 return response.approved()
+diff -ruN a/shipfast/src/main/java/com/shipfast/pricing/Coupon.java b/shipfast/src/main/java/com/shipfast/pricing/Coupon.java
+--- a/shipfast/src/main/java/com/shipfast/pricing/Coupon.java
++++ b/shipfast/src/main/java/com/shipfast/pricing/Coupon.java
+@@ -92,6 +92,22 @@
+         return timesUsed.get();
+     }
+ 
++    boolean tryClaim() {
++        while (true) {
++            int used = timesUsed.get();
++            if (isLimited() && used >= maxUses) {
++                return false;
++            }
++            if (timesUsed.compareAndSet(used, used + 1)) {
++                return true;
++            }
++        }
++    }
++
++    void unclaim() {
++        timesUsed.decrementAndGet();
++    }
++
+     void recordUse() {
+         timesUsed.incrementAndGet();
+     }
+diff -ruN a/shipfast/src/main/java/com/shipfast/pricing/CouponService.java b/shipfast/src/main/java/com/shipfast/pricing/CouponService.java
+--- a/shipfast/src/main/java/com/shipfast/pricing/CouponService.java
++++ b/shipfast/src/main/java/com/shipfast/pricing/CouponService.java
+@@ -38,7 +38,7 @@
+         if (!clock.instant().isBefore(coupon.getExpiresAt())) {
+             throw new CouponRejectedException(code, Reason.EXPIRED);
+         }
+-        if (coupon.isLimited() && coupon.getTimesUsed() > coupon.getMaxUses()) {
++        if (coupon.isLimited() && coupon.getTimesUsed() >= coupon.getMaxUses()) {
+             throw new CouponRejectedException(code, Reason.EXHAUSTED);
+         }
+         if (subtotal.lessThan(coupon.getMinimumSpend())) {
+@@ -52,6 +52,17 @@
+         coupon.recordUse();
+     }
+ 
++    /** Atomically takes one use of the coupon; throws if none are left. */
++    public void claim(Coupon coupon) {
++        if (!coupon.tryClaim()) {
++            throw new CouponRejectedException(coupon.getCode(), Reason.EXHAUSTED);
++        }
++    }
++
++    public void unclaim(Coupon coupon) {
++        coupon.unclaim();
++    }
++
+     private static String normalize(String code) {
+         return code.trim().toUpperCase(Locale.ROOT);
+     }
+diff -ruN a/shipfast/src/main/java/com/shipfast/reporting/DailySalesReport.java b/shipfast/src/main/java/com/shipfast/reporting/DailySalesReport.java
+--- a/shipfast/src/main/java/com/shipfast/reporting/DailySalesReport.java
++++ b/shipfast/src/main/java/com/shipfast/reporting/DailySalesReport.java
+@@ -7,7 +7,6 @@
+ import com.shipfast.order.OrderRepository;
+ import java.time.Instant;
+ import java.time.LocalDate;
+-import java.time.LocalTime;
+ import java.time.ZoneId;
+ import java.util.EnumMap;
+ import java.util.List;
+@@ -48,10 +47,10 @@
+ 
+     List<Order> ordersPlacedOn(LocalDate date) {
+         Instant start = date.atStartOfDay(storeZone).toInstant();
+-        Instant end = date.atTime(LocalTime.of(23, 59, 59)).atZone(storeZone).toInstant();
++        Instant end = date.plusDays(1).atStartOfDay(storeZone).toInstant();
+         return orders.findAll().stream()
+                 .filter(order -> order.getStatus().countsAsRevenue())
+-                .filter(order -> !order.getPlacedAt().isBefore(start) && !order.getPlacedAt().isAfter(end))
++                .filter(order -> !order.getPlacedAt().isBefore(start) && order.getPlacedAt().isBefore(end))
+                 .toList();
+     }
+ }
