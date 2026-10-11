@@ -38,7 +38,7 @@ public class CouponService {
         if (!clock.instant().isBefore(coupon.getExpiresAt())) {
             throw new CouponRejectedException(code, Reason.EXPIRED);
         }
-        if (coupon.isLimited() && coupon.getTimesUsed() >= coupon.getMaxUses()) {
+        if (coupon.isLimited() && coupon.getTimesUsed() > coupon.getMaxUses()) {
             throw new CouponRejectedException(code, Reason.EXHAUSTED);
         }
         if (subtotal.lessThan(coupon.getMinimumSpend())) {
@@ -50,24 +50,6 @@ public class CouponService {
     /** Counts a use of the coupon. Call only once the order it was applied to has been paid. */
     public void redeem(Coupon coupon) {
         coupon.recordUse();
-    }
-
-    /**
-     * Atomically takes one use of the coupon, enforcing {@code maxUses} even when many checkouts
-     * call this concurrently. Call this once per order, before charging the customer, and
-     * {@link #unclaim} it if the order does not end up paid.
-     *
-     * @throws CouponRejectedException with reason {@code EXHAUSTED} if no uses are left
-     */
-    public void claim(Coupon coupon) {
-        if (!coupon.tryClaim()) {
-            throw new CouponRejectedException(coupon.getCode(), Reason.EXHAUSTED);
-        }
-    }
-
-    /** Releases a use taken by {@link #claim}, e.g. because the payment was declined. */
-    public void unclaim(Coupon coupon) {
-        coupon.unclaim();
     }
 
     private static String normalize(String code) {

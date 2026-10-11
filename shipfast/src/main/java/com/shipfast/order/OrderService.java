@@ -76,41 +76,25 @@ public class OrderService {
         Coupon coupon = null;
         if (request.hasCoupon()) {
             coupon = coupons.validate(request.couponCode(), pricing.subtotal(lines));
-            // Claim the use now, atomically, rather than after payment: validate() + a later
-            // increment left a window across the whole card charge for other checkouts to also
-            // pass validate() before any of them incremented the counter.
-            coupons.claim(coupon);
         }
+        PriceBreakdown price = pricing.quote(lines, customer.shippingAddress(), coupon);
 
-        PriceBreakdown price;
-        Order order;
-        PaymentOutcome payment;
-        try {
-            price = pricing.quote(lines, customer.shippingAddress(), coupon);
-            reserveStock(lines);
-            order = new Order(ids.next("ord"), customer.id(), lines, price, clock.instant());
-            payment = payments.charge(order.getId(), customer.paymentToken(), price.total());
-        } catch (RuntimeException e) {
-            // Nothing after claim() settled the order one way or the other (out of stock, the
-            // gateway being unreachable, or anything else) - give the slot back, since claim()
-            // is the only thing that took it.
-            if (coupon != null) {
-                coupons.unclaim(coupon);
-            }
-            throw e;
-        }
+        reserveStock(lines);
+
+        Order order = new Order(ids.next("ord"), customer.id(), lines, price, clock.instant());
+        PaymentOutcome payment = payments.charge(order.getId(), customer.paymentToken(), price.total());
 
         if (!payment.approved()) {
             releaseStock(lines);
-            if (coupon != null) {
-                coupons.unclaim(coupon);
-            }
             order.markDeclined(payment.declineCode());
             orders.save(order);
             return order;
         }
 
         commitStock(lines);
+        if (coupon != null) {
+            coupons.redeem(coupon);
+        }
         order.markPaid(payment.transactionId());
         orders.save(order);
         events.publish(placedEvent(order, customer, price));

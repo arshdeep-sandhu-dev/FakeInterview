@@ -95,27 +95,4 @@ public class Coupon {
     void recordUse() {
         timesUsed.incrementAndGet();
     }
-
-    /**
-     * Atomically checks the limit and takes one use in a single step, so concurrent callers can't
-     * all pass the check before any of them increments. Returns {@code false} (no side effect) if
-     * no uses are left.
-     */
-    boolean tryClaim() {
-        while (true) {
-            int used = timesUsed.get();
-            if (isLimited() && used >= maxUses) {
-                return false;
-            }
-            if (timesUsed.compareAndSet(used, used + 1)) {
-                return true;
-            }
-            // another thread claimed or released a use between get() and compareAndSet(); retry
-        }
-    }
-
-    /** Gives back a use that was claimed for an order that did not end up paid. */
-    void unclaim() {
-        timesUsed.decrementAndGet();
-    }
 }
